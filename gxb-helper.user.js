@@ -2,7 +2,7 @@
 // @name         我不想上高校邦
 // @name:en      I Don't Wanna Take Gaoxiaobang
 // @namespace    https://github.com/Wu557666/gaoxiaobang
-// @version      1.4.1
+// @version      1.4.2
 // @description  视频/页面进度 + 讨论回复 + DeepSeek 测验答题；默认暂停，各模块需启用，支持开始和暂停
 // @author       combined from Wu557666/gaoxiaobang + Tyrone2333/Gaoxiaobang-Script
 // @homepageURL  https://github.com/xiaoyu884/i-dont-wanna-take-gaoxiaobang
@@ -31,6 +31,12 @@
     const QUIZ_CONFIRM_KEY = 'gb_quiz_confirm';
     const DEEPSEEK_KEY = 'gb_deepseek_key';
     const DEEPSEEK_MODEL = 'gb_deepseek_model';
+    const DEEPSEEK_CONFIG_REVISION = 'gb_deepseek_config_revision';
+    const apiRevision = () => GM_getValue(DEEPSEEK_CONFIG_REVISION, 'initial');
+    const DEFAULT_MODEL = 'deepseek-flash';
+    // Official retirement / alias notices checked on 2026-10-13. Do not rewrite custom values.
+    const RETIRED_MODELS = new Set(['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp']);
+    const ANSWER_TOKEN_BUDGET = 128;
     const REQUEST_TIMEOUT = 30000;
     const EXECUTION_SESSION_KEY = 'gb_execution_session';
     const MODULE_KEYS = { progress: 'gb_enable_progress', discussion: 'gb_enable_discussion', ai: 'gb_enable_ai' };
@@ -40,12 +46,20 @@
         .every(module => session.modules.includes(module) === moduleEnabled(module));
     const pendingRequests = new Set();
     let executionSession = null;
+    let connectionTesting = false;
+    // Keep credentials only in memory, never in page sessionStorage or diagnostics.
+    let executionApiConfig = null;
+    let connectionApiConfig = null;
+    const apiConfig = () => ({ apiKey: settings.apiKey, model: settings.model });
+    const sameApiConfig = snapshot => snapshot?.apiKey === settings.apiKey && snapshot?.model === settings.model;
     try {
         const saved = JSON.parse(sessionStorage.getItem(EXECUTION_SESSION_KEY) || 'null');
         if (saved && typeof saved.host === 'string' && typeof saved.course === 'string'
             && (saved.user === null || typeof saved.user === 'string') && Array.isArray(saved.modules)
+            && typeof saved.apiRevision === 'string' && saved.apiRevision.length > 0
             && saved.modules.length > 0 && new Set(saved.modules).size === saved.modules.length
             && saved.modules.every(module => Object.hasOwn(MODULE_KEYS, module))) executionSession = saved;
+        if (saved && !executionSession) sessionStorage.removeItem(EXECUTION_SESSION_KEY);
     } catch (_) { /* A missing or malformed session starts paused. */ }
 
     const routeClassId = () => location.pathname.match(/\/class\/([^/]+)/)?.[1] || null;
@@ -96,9 +110,13 @@
     const executionRequested = () => executionSession?.host === location.host
         && executionSession.course === String(classId())
         && (userId() === null || executionSession.user === userId())
-        && sameModules(executionSession);
+        && sameModules(executionSession) && executionSession.apiRevision === apiRevision() && sameApiConfig(executionApiConfig);
     const executionAllowed = () => executionRequested() && executionSession.user === userId();
     const assertScope = () => {
+        if (executionSession && (executionSession.apiRevision !== apiRevision() || !sameApiConfig(executionApiConfig))) {
+            pauseExecution();
+            throw new Error('DeepSeek 配置已改变，已暂停；请检查设置后重新开始');
+        }
         if (!executionAllowed()) throw new Error('脚本已暂停，或当前账号、课程未授权开始');
         if ((scopeAtStart && (scopeAtStart !== scopedKey(STATE_KEY) || chapterAtStart !== currentChapterId()))
             || (epochAtStart !== null && epochAtStart !== routeEpoch)) {
@@ -136,15 +154,22 @@
         const panel = document.getElementById('gxb-helper-controls');
         if (!panel) return;
         const running = executionAllowed();
-        panel.querySelector('#gxb-status').textContent = running ? '已启动：仅运行已启用模块'
+        panel.querySelector('#gxb-status').textContent = connectionTesting ? '正在测试 DeepSeek 连接；课程已暂停' : running ? '已启动：仅运行已启用模块'
             : executionRequested() ? '等待账号信息' : '已暂停';
-        panel.querySelector('#gxb-start').disabled = running && (mainRunning || navigating);
-        panel.querySelector('#gxb-pause').disabled = !executionSession;
+        panel.querySelector('#gxb-start').disabled = connectionTesting || (running && (mainRunning || navigating));
+        panel.querySelector('#gxb-pause').disabled = !executionSession && !connectionTesting;
         panel.querySelectorAll('[data-gxb-module]').forEach(input => { input.checked = moduleEnabled(input.dataset.gxbModule); });
+        const retired = RETIRED_MODELS.has(settings.model);
+        panel.querySelector('#gxb-model-notice').textContent = retired
+            ? '已保存的模型名已退役。请迁移或在菜单中设置可用模型；不会自动替换或调用 API。' : '';
+        panel.querySelector('#gxb-migrate-model').hidden = !retired;
+        panel.querySelector('#gxb-test-connection').disabled = connectionTesting;
     }
 
     function pauseExecution() {
         executionSession = null;
+        executionApiConfig = null;
+        connectionApiConfig = null;
         try { sessionStorage.removeItem(EXECUTION_SESSION_KEY); } catch (_) { /* Local pause still applies. */ }
         routeEpoch++;
         routeRestartRequested = false;
@@ -159,11 +184,13 @@
     }
 
     function startExecution() {
+        if (connectionTesting) return;
         if (executionAllowed() && (mainRunning || navigating)) return;
         if (!selectedModules().length) { alert('请先启用至少一个模块，再点击开始。'); return; }
         if (!classId() || (!userId() && (unsafeWindow.gxb?.user || executionSession?.user != null))) { alert('请等待课程及账号信息加载后再开始。'); return; }
         if (executionSession || mainRunning || navigating) pauseExecution();
-        executionSession = { host: location.host, course: String(classId()), user: userId(), modules: selectedModules() };
+        executionApiConfig = apiConfig();
+        executionSession = { host: location.host, course: String(classId()), user: userId(), modules: selectedModules(), apiRevision: apiRevision() };
         try { sessionStorage.setItem(EXECUTION_SESSION_KEY, JSON.stringify(executionSession)); }
         catch (_) { console.warn('⚠️ 无法保存本标签页的运行状态；页面切换后请重新开始'); }
         refreshControls();
@@ -187,9 +214,14 @@
             + '<label style="display:block"><input type="checkbox" data-gxb-module="discussion"> 发布讨论回复</label>'
             + '<label style="display:block"><input type="checkbox" data-gxb-module="ai"> AI 测验答案</label>'
             + '<button id="gxb-start" type="button">开始 / 重试</button> <button id="gxb-pause" type="button">暂停</button>'
-            + '<div style="font-size:12px;color:#555">更改模块后，请重新开始。</div>';
+            + '<div style="font-size:12px;color:#555">更改模块后，请重新开始。</div>'
+            + '<div id="gxb-model-notice" role="status" style="font-size:12px;color:#8a4100"></div>'
+            + '<button id="gxb-migrate-model" type="button" hidden>迁移到 deepseek-flash</button>'
+            + '<button id="gxb-test-connection" type="button">测试 DeepSeek 连接（可能收费）</button>';
         panel.querySelector('#gxb-start').addEventListener('click', startExecution);
         panel.querySelector('#gxb-pause').addEventListener('click', pauseExecution);
+        panel.querySelector('#gxb-migrate-model').addEventListener('click', migrateDeepSeekModel);
+        panel.querySelector('#gxb-test-connection').addEventListener('click', () => { void testDeepSeekConnection(); });
         panel.querySelectorAll('[data-gxb-module]').forEach(input => {
             input.addEventListener('change', () => changeModule(input.dataset.gxbModule, input.checked));
         });
@@ -199,22 +231,39 @@
 
     const settings = {
         get apiKey() { return GM_getValue(DEEPSEEK_KEY, ''); },
-        set apiKey(v) { GM_setValue(DEEPSEEK_KEY, v); },
-        get model() { return GM_getValue(DEEPSEEK_MODEL, 'deepseek-chat'); },
-        set model(v) { GM_setValue(DEEPSEEK_MODEL, v); },
+        set apiKey(v) { updateApiSetting(DEEPSEEK_KEY, v); },
+        get model() { return GM_getValue(DEEPSEEK_MODEL, DEFAULT_MODEL); },
+        set model(v) { updateApiSetting(DEEPSEEK_MODEL, v); },
         get confirmBeforeSubmit() { return GM_getValue(QUIZ_CONFIRM_KEY, 'on') === 'on'; },
         set confirmBeforeSubmit(v) { GM_setValue(QUIZ_CONFIRM_KEY, v ? 'on' : 'off'); },
     };
+    if (executionSession) executionApiConfig = apiConfig();
+
+    function updateApiSetting(key, value) {
+        if (GM_getValue(key) === value) return;
+        const newRevision = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+        // Invalidate both existing sessions and a Start interleaved with the setting write.
+        GM_setValue(DEEPSEEK_CONFIG_REVISION, newRevision());
+        GM_setValue(key, value);
+        GM_setValue(DEEPSEEK_CONFIG_REVISION, newRevision());
+    }
 
     // ========== 菜单命令 ==========
     GM_registerMenuCommand('⚙️ 设置 DeepSeek API Key', () => {
         const key = prompt('DeepSeek API Key (sk-...，留空可清除):', '');
-        if (key !== null) settings.apiKey = key.trim();
+        if (key !== null) { pauseExecution(); settings.apiKey = key.trim(); }
     });
     GM_registerMenuCommand('⚙️ 设置 DeepSeek 模型', () => {
         const model = prompt('DeepSeek 模型名称:', settings.model);
-        if (model !== null && model.trim()) settings.model = model.trim();
+        if (model !== null && model.trim()) {
+            if (RETIRED_MODELS.has(model.trim())) { alert('该模型名已退役，请使用 deepseek-flash 或其他可用模型名称。'); return; }
+            pauseExecution();
+            settings.model = model.trim();
+            refreshControls();
+        }
     });
+    GM_registerMenuCommand('⚙️ 迁移已退役 DeepSeek 模型', migrateDeepSeekModel);
+    GM_registerMenuCommand('🔌 测试 DeepSeek 连接（可能收费）', () => { void testDeepSeekConnection(); });
     GM_registerMenuCommand('🤖 切换答题模式: ' + (settings.confirmBeforeSubmit ? '提交前确认(当前)' : '自动提交(当前)'), () => {
         pauseExecution();
         settings.confirmBeforeSubmit = !settings.confirmBeforeSubmit;
@@ -231,55 +280,137 @@
     });
 
     // ========== DeepSeek 答题 ==========
-    async function askDeepSeek(question) {
-        assertModule('ai');
+    function migrateDeepSeekModel() {
+        const oldModel = settings.model;
+        if (!RETIRED_MODELS.has(oldModel)) { alert('当前模型不在已知退役名单中，已保留原设置。'); return; }
+        if (!confirm(`已保存的 ${oldModel} 已退役。是否迁移到 ${DEFAULT_MODEL}？\n仅修改模型设置，保留 API Key；不会调用 API 或启动课程。请求使用非思考模式，迁移后需重新点击开始。`)) return;
+        // A different tab may have changed shared settings while the prompt was open.
+        if (settings.model !== oldModel) { alert('模型设置已改变，未覆盖。请重新检查设置。'); return; }
+        pauseExecution();
+        settings.model = DEFAULT_MODEL;
+        refreshControls();
+        alert('模型已迁移到 deepseek-flash；脚本保持暂停。可主动测试连接或重新开始。');
+    }
+
+    function deepSeekError(kind, detail) {
+        const error = new Error(`DeepSeek [${kind}] ${detail}`);
+        error.stopQuiz = true;
+        return error;
+    }
+
+    function providerError(status, data) {
+        // Inspect provider fields only for classification; never display raw errors, keys or responses.
+        const code = typeof data?.error?.code === 'string' ? data.error.code.toLowerCase() : '';
+        const message = typeof data?.error?.message === 'string' ? data.error.message : '';
+        if (status === 401 || code === 'invalid_api_key') return deepSeekError('密钥错误', '请在菜单中检查或重新设置 API Key。');
+        if (status === 402 || code === 'insufficient_quota') return deepSeekError('额度不足', '请检查 DeepSeek 账户余额与额度。');
+        if (status === 403) return deepSeekError('权限不足', '请检查 API Key 权限和账户状态。');
+        if (status === 429) return deepSeekError('限流', '请等待后手动重试；本轮不继续请求。');
+        if (status === 404 || ['model_not_found', 'model_not_exist', 'invalid_model', 'model_not_available'].includes(code)
+            || data?.error?.param === 'model' || /model.*(?:not exist|not found|unavailable|unsupported)|模型.*(?:不存在|不可用)/i.test(message)) {
+            return deepSeekError('模型不可用', '请核对模型设置；不会自动切换到其他收费模型。');
+        }
+        if (status === 400 || status === 422) return deepSeekError('请求参数', '请核对模型兼容性和脚本版本。');
+        if (status >= 500) return deepSeekError('服务异常', '请稍后手动重试。');
+        if (!Number.isInteger(status) || status <= 0) return deepSeekError('网络失败', '请检查网络及脚本管理器对 api.deepseek.com 的访问权限。');
+        return deepSeekError('API 错误', `HTTP ${status}，请检查账户和模型设置。`);
+    }
+
+    function parseDeepSeekAnswer(data, question) {
+        if (!Array.isArray(data?.choices) || data.choices.length !== 1) throw deepSeekError('响应格式', '缺少唯一答案，未填写或提交。');
+        const choice = data.choices[0];
+        if (choice?.finish_reason === 'length') throw deepSeekError('输出截断', '答案未完整生成，未填写或提交。请手动检查或重试。');
+        if (choice?.finish_reason !== 'stop' || choice.message?.tool_calls?.length) throw deepSeekError('生成未完成', '响应未正常结束，未填写或提交。');
+        // reasoning_content is never an answer, even if content is empty.
+        const reply = choice.message?.content;
+        if (typeof reply !== 'string' || !reply.trim()) throw deepSeekError('空答案', '未收到最终答案，未填写或提交。');
+        const answer = reply.trim().toUpperCase();
+        if (!/^[A-Z](?:[\s,，、;；]*[A-Z])*[.!。]?$/.test(answer)) throw new Error('AI 未返回明确的选项字母');
+        const letters = [...new Set(answer.match(/[A-Z]/g))];
+        if (letters.some(letter => letter.charCodeAt(0) - 65 >= question.options.length)) throw new Error('AI 返回越界选项');
+        if (!question.multi && letters.length !== 1) throw new Error('单选题返回了多个选项');
+        return letters;
+    }
+
+    async function requestDeepSeek(question) {
+        const apiKey = settings.apiKey, model = settings.model;
+        if (!apiKey) throw deepSeekError('未配置密钥', '请通过菜单设置 API Key。');
+        if (typeof model !== 'string' || !model.trim()) throw deepSeekError('模型设置', '请在菜单中设置有效的模型名称。');
+        if (RETIRED_MODELS.has(model)) throw deepSeekError('模型已退役', '请点击迁移按钮或在菜单中设置可用模型，再重新开始。');
         const letterNote = question.multi
             ? '可能有多个正确选项，请返回所有正确选项的字母连在一起（如 ABD）'
             : '请只返回一个正确选项的字母';
         const prompt = `你是答题助手。${letterNote}，不要任何其他文字、解释或标点。\n\n题目：${question.title}\n\n选项：\n${question.options.map((o, i) => `${String.fromCharCode(65 + i)}. ${o}`).join('\n')}`;
 
         return cancellableRequest((resolve, reject) => {
-            return GM_xmlhttpRequest({
-                method: 'POST',
-                url: 'https://api.deepseek.com/chat/completions',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${settings.apiKey}`,
-                },
-                data: JSON.stringify({
-                    model: settings.model,
-                    messages: [
-                        { role: 'system', content: question.multi ? '你只输出选项字母的组合，如 ABD。' : '你只输出一个选项字母。' },
-                        { role: 'user', content: prompt },
-                    ],
-                    temperature: 0,
-                    max_tokens: question.multi ? 8 : 4,
-                }),
-                timeout: 60000,
-                onload: res => {
-                    try {
-                        if (typeof res.status === 'number' && (res.status < 200 || res.status >= 300)) throw new Error(`DeepSeek HTTP ${res.status}`);
-                        const data = JSON.parse(res.responseText);
-                        if (data.error) throw new Error('DeepSeek API 返回错误，请检查密钥、模型和额度');
-                        const reply = data.choices?.[0]?.message?.content;
-                        if (typeof reply !== 'string') throw new Error('AI 返回内容为空');
-                        const answer = reply.trim().toUpperCase();
-                        // Parse an answer, not arbitrary letters contained in an explanation.
-                        if (!/^[A-Z](?:[\s,，、;；]*[A-Z])*[.!。]?$/.test(answer)) {
-                            throw new Error('AI 未返回明确的选项字母');
-                        }
-                        const letters = [...new Set(answer.match(/[A-Z]/g))];
-                        if (letters.some(letter => letter.charCodeAt(0) - 65 >= question.options.length)) {
-                            throw new Error('AI 返回越界选项');
-                        }
-                        if (!question.multi && letters.length !== 1) throw new Error('单选题返回了多个选项');
-                        resolve(letters);
-                    } catch (error) { reject(error); }
-                },
-                onerror: () => reject(new Error('DeepSeek 请求失败')),
-                ontimeout: () => reject(new Error('DeepSeek 请求超时')),
-            });
+            try {
+                return GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: 'https://api.deepseek.com/chat/completions',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apiKey}`,
+                    },
+                    data: JSON.stringify({
+                        model,
+                        messages: [
+                            { role: 'system', content: question.multi ? '你只输出选项字母的组合，如 ABD。' : '你只输出一个选项字母。' },
+                            { role: 'user', content: prompt },
+                        ],
+                        temperature: 0,
+                        thinking: { type: 'disabled' },
+                        max_tokens: ANSWER_TOKEN_BUDGET,
+                        stream: false,
+                    }),
+                    timeout: 60000,
+                    onload: res => {
+                        try {
+                            let data;
+                            try { data = JSON.parse(res.responseText); } catch (_) { /* Classify HTTP before malformed bodies. */ }
+                            if (res.status !== 200 || data?.error) throw providerError(res.status, data);
+                            if (!data) throw deepSeekError('响应格式', '返回内容不是有效 JSON，未填写或提交。');
+                            resolve(parseDeepSeekAnswer(data, question));
+                        } catch (error) { reject(error); }
+                    },
+                    onerror: () => reject(deepSeekError('网络失败', '请检查网络及脚本管理器对 api.deepseek.com 的访问权限。')),
+                    ontimeout: () => reject(deepSeekError('超时', '60 秒内未收到完整响应，请稍后手动重试。')),
+                    onabort: () => reject(deepSeekError('请求取消', '本轮已停止。')),
+                });
+            } catch (_) {
+                reject(deepSeekError('网络失败', '请求未能发送，请检查脚本管理器和网络权限。'));
+            }
         });
+    }
+
+    async function askDeepSeek(question) {
+        assertModule('ai');
+        return requestDeepSeek(question);
+    }
+
+    async function testDeepSeekConnection() {
+        if (connectionTesting) return;
+        const apiKey = settings.apiKey, model = settings.model;
+        if (!apiKey) { alert('请先在菜单中设置 DeepSeek API Key。'); return; }
+        if (RETIRED_MODELS.has(model)) { alert('模型名已退役，请先迁移或设置可用模型。'); return; }
+        if (!confirm(`连接测试将调用一次 ${model}，可能产生 DeepSeek API 费用。\n仅发送固定测试文字，不发送课程题目、不填写或提交。测试会暂停课程执行；完成后需手动开始。是否继续？`)) return;
+        if (settings.apiKey !== apiKey || settings.model !== model) { alert('API 设置已改变，未发送测试请求。请重新检查设置。'); return; }
+        pauseExecution();
+        connectionTesting = true;
+        connectionApiConfig = { apiKey, model };
+        refreshControls();
+        const testEpoch = routeEpoch;
+        try {
+            const letters = await requestDeepSeek({ title: '这是连接测试，请选择 A。', options: ['连接正常', '其他'], multi: false });
+            if (routeEpoch !== testEpoch) return;
+            if (!sameApiConfig(connectionApiConfig)) { pauseExecution(); return; }
+            if (letters.join('') !== 'A') throw new Error('模型未按固定测试指令回答，未确认连接测试通过。');
+            alert('DeepSeek 连接测试通过：收到完整、合法的固定测试答案。此结果不保证课程答案正确；脚本保持暂停。');
+        } catch (error) {
+            if (routeEpoch === testEpoch) {
+                if (!sameApiConfig(connectionApiConfig)) pauseExecution();
+                else alert('连接测试失败：' + error.message);
+            }
+        } finally { connectionTesting = false; connectionApiConfig = null; refreshControls(); }
     }
 
     const stripTags = value => {
@@ -391,6 +522,7 @@
             if (!questions.length) return;
             const confirmBeforeSubmit = settings.confirmBeforeSubmit;
             let answered = 0;
+            let failureReason = '';
             for (const question of questions) {
                 assertModule('ai');
                 try {
@@ -401,7 +533,9 @@
                     answered++;
                     console.log(`✅ 第${question.index + 1}题 → ${letters.join(', ')}`);
                 } catch (error) {
+                    failureReason = error.message;
                     console.error(`❌ 第${question.index + 1}题失败: ${error.message}`);
+                    if (error.stopQuiz) break;
                 }
                 await wait(1200);
             }
@@ -412,7 +546,7 @@
                 submitButton.style.outline = '3px solid red';
             }
             if (answered !== questions.length) {
-                alert(`AI 成功作答 ${answered}/${questions.length} 道题，有 ${questions.length - answered} 道题失败。未自动提交，请检查答案后手动作答或使用菜单重试。`);
+                alert(`AI 成功作答 ${answered}/${questions.length} 道题，有 ${questions.length - answered} 道题未完成。未自动提交。\n${failureReason}\n请检查答案后手动作答或使用菜单重试。`);
                 return;
             }
             if (confirmBeforeSubmit) {
@@ -1044,8 +1178,9 @@
     let courseReloading = false;
     const checkCourseRoute = () => {
         const next = routeClassId();
-        if (executionSession && (!sameModules(executionSession)
-            || (userId() !== null && executionSession.user !== userId()))) pauseExecution();
+        if ((executionSession && (!sameModules(executionSession) || executionSession.apiRevision !== apiRevision() || !sameApiConfig(executionApiConfig)
+            || (userId() !== null && executionSession.user !== userId())))
+            || (connectionTesting && connectionApiConfig && !sameApiConfig(connectionApiConfig))) pauseExecution();
         if (courseReloading || next === observedCourseRoute) return;
         observedCourseRoute = next;
         routeEpoch++;
@@ -1078,7 +1213,7 @@
     if (executionSession && (executionSession.host !== location.host
         || (classId() && executionSession.course !== String(classId()))
         || (userId() !== null && executionSession.user !== userId())
-        || !sameModules(executionSession))) pauseExecution();
+        || !sameModules(executionSession) || executionSession.apiRevision !== apiRevision())) pauseExecution();
     mountControls();
     if (executionRequested()) void main();
 })();
