@@ -36,13 +36,15 @@ function boot({ html = '', pageGlobals = {}, gmStore = {}, deepseekReply = 'B', 
     const sessionUrl = new URL(url);
     const activeUser = pageGlobals.gxb?.user?._?.currentUser?.userId;
     if (sessionRecord !== undefined || autoStart) {
-        const record = sessionRecord === undefined ? { host: sessionUrl.host,
+        let record = sessionRecord === undefined ? { host: sessionUrl.host,
             course: sessionUrl.pathname.match(/\/class\/([^/]+)/)?.[1] || String(pageGlobals.classinfo?.classId || ''),
             user: activeUser == null || activeUser === '' ? null : String(activeUser),
             modules: Object.entries(moduleKeys).filter(([, key]) => store[key] === 'on').map(([module]) => module) } : sessionRecord;
+        // Existing fixtures represent current-version consent; explicit undefined models a legacy session.
+        if (record && !Object.hasOwn(record, 'apiRevision')) record = { ...record, apiRevision: store.gb_deepseek_config_revision || 'initial' };
         if (record != null) window.sessionStorage.setItem('gb_execution_session', JSON.stringify(record));
     }
-    const fx = { ajaxCalls: [], fetchCalls: [], alerts: [], deepseekReqs: [], intervals: [], timeouts: [], submits: 0, confirms: 0, deleted: {}, menus: [], navigations: [], reloads: 0, apiAborts: 0 };
+    const fx = { ajaxCalls: [], fetchCalls: [], alerts: [], confirmationPrompts: [], deepseekReqs: [], intervals: [], timeouts: [], submits: 0, confirms: 0, deleted: {}, menus: [], navigations: [], reloads: 0, apiAborts: 0 };
 
     window.setTimeout = (fn, ms = 0) => {
         if (ms >= 10000) { fx.timeouts.push({ fn, ms }); return fx.timeouts.length + 1; }
@@ -59,10 +61,11 @@ function boot({ html = '', pageGlobals = {}, gmStore = {}, deepseekReply = 'B', 
         fx.deepseekReqs.push(opts);
         const handle = { abort() { fx.apiAborts++; opts.onabort?.({}); } };
         if (apiResponder) return apiResponder(opts, fx.deepseekReqs.length) || handle;
-        if (opts.onload) opts.onload({ status: 200, responseText: JSON.stringify({ choices: [{ message: { content: deepseekReply } }] }) });
+        if (opts.onload) opts.onload({ status: 200, responseText: JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: deepseekReply } }] }) });
         return handle;
     };
     window.alert = (m) => fx.alerts.push(m);
+    window.confirm = (m) => { fx.confirmationPrompts.push(m); return true; };
     window.prompt = () => 'sk-test';
     window.Element.prototype.scrollIntoView = function () {};
     // jsdom has no layout engine: offsetParent is always null, so "is visible" checks fail.
@@ -241,7 +244,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         assert(req.url === 'https://api.deepseek.com/chat/completions', 'posts to api.deepseek.com/chat/completions');
         assert(req.headers.Authorization === 'Bearer sk-test-123', 'sends configured key as Bearer token');
         const body = JSON.parse(req.data);
-        assert(body.model === 'deepseek-chat' && body.temperature === 0, 'uses deepseek-chat, temperature 0');
+        assert(body.model === 'deepseek-flash' && body.temperature === 0, 'uses deepseek-flash, temperature 0');
         assert(body.messages[1].content.includes('以下哪项属于用户思维'), 'prompt embeds question title');
         assert(body.messages[1].content.includes('B. 站在用户角度'), 'prompt embeds lettered options');
         assert(window.document.querySelector('i[answer_id="a2"]').className.includes('checked'), 'selects option matching AI letter (B → a2)');
@@ -390,7 +393,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         assert(fixture.fx.alerts.length > 0, 'failed question produces a visible review warning');
     }
     for (const [name, apiResponder] of [
-        ['HTTP failure despite a plausible body', opts => opts.onload({ status: 401, responseText: '{"choices":[{"message":{"content":"A"}}]}' })],
+        ['HTTP failure despite a plausible body', opts => opts.onload({ status: 401, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"A"}}]}' })],
         ['invalid JSON', opts => opts.onload({ status: 200, responseText: '{' })],
         ['network error', opts => opts.onerror({})],
         ['request timeout', opts => opts.ontimeout({})],
@@ -411,7 +414,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         ];
         const fixture = quizFixture({ questions,
             html: '<i class="gxb-icon-radio" answer_id="a1"></i><i class="gxb-icon-radio" answer_id="b1"></i><button id="quizSubmit">Submit</button>',
-            apiResponder: (opts, n) => opts.onload({ status: 200, responseText: JSON.stringify({ choices: [{ message: { content: n === 1 ? 'A' : 'Z' } }] }) }),
+            apiResponder: (opts, n) => opts.onload({ status: 200, responseText: JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: n === 1 ? 'A' : 'Z' } }] }) }),
         });
         await flush();
         assert(fixture.fx.deepseekReqs.length === 2 && !submitted(fixture), 'one failed question blocks submission after another question succeeds');
@@ -800,7 +803,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
             pageGlobals: { classinfo: { classId: 10001 }, unitList: [{ contentType: 'Quiz', chapterId: 100 }, { contentType: 'Quiz', chapterId: 101 }] },
             apiResponder: (opts, n) => {
                 if (n === 1) pendingReply = opts;
-                else opts.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"A"}}]}' });
+                else opts.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"A"}}]}' });
             },
             onReady(window) {
                 const button = window.document.getElementById('quizSubmit');
@@ -815,7 +818,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         });
         await flush();
         fixture.location.hash = '#chapterId=101';
-        pendingReply.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"B"}}]}' });
+        pendingReply.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"B"}}]}' });
         await flush();
         assert(!clicks.includes('a2'), 'a delayed AI reply from the old route cannot select reused answer IDs in the new quiz');
         assert(fixture.fx.deepseekReqs.length === 2 && selectedIds(fixture).includes('a1'), 'the new route runs after the stale request releases its guard');
@@ -1417,7 +1420,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         clickControl(fixture, 'gxb-start');
         await flush();
         clickControl(fixture, 'gxb-pause');
-        pending.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"B"}}]}' });
+        pending.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"B"}}]}' });
         await flush();
         assert(fixture.fx.apiAborts === 1 && !controlSession(fixture), 'Pause clears session consent and aborts an available pending DeepSeek request handle');
         assert(selectedIds(fixture).length === 0 && !submitted(fixture) && fixture.fx.navigations.length === 0 && scopedWrites(fixture).length === 0, 'late AI response after Pause cannot select, submit, navigate, or write completion');
@@ -1426,14 +1429,14 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         let pending;
         const clicks = [];
         const fixture = quizFixture({ autoStart: false, enabledModules: ['ai'],
-            apiResponder: (opts, n) => n === 1 ? (pending = opts, undefined) : opts.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"A"}}]}' }),
+            apiResponder: (opts, n) => n === 1 ? (pending = opts, undefined) : opts.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"A"}}]}' }),
             onReady(window) { window.document.querySelectorAll('i[answer_id]').forEach(icon => icon.addEventListener('click', () => clicks.push(icon.getAttribute('answer_id')))); },
         });
         clickControl(fixture, 'gxb-start');
         await flush();
         clickControl(fixture, 'gxb-pause');
         fixture.fx.menus.find(menu => /重试当前页面/.test(menu.name)).callback();
-        pending.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"B"}}]}' });
+        pending.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"B"}}]}' });
         await flush();
         assert(fixture.fx.deepseekReqs.length === 2 && controlSession(fixture) && submitted(fixture), 'explicit restart while cancellation settles runs the next request after the old run releases its guard');
         assert(!clicks.includes('a2') && JSON.stringify(selectedIds(fixture)) === '["a1"]', 'cancelled old AI response cannot affect a restarted quiz run');
@@ -1583,7 +1586,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         clickControl(fixture, 'gxb-start');
         await flush();
         fixture.fx.menus.find(menu => /暂停当前标签页/.test(menu.name)).callback();
-        pending.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"B"}}]}' });
+        pending.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"B"}}]}' });
         await flush();
         assert(fixture.fx.apiAborts === 0 && !controlSession(fixture) && selectedIds(fixture).length === 0 && !submitted(fixture), 'Pause remains effective when the pending request handle offers no abort method');
     }
@@ -1606,7 +1609,7 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         const fixture = quizFixture({ enabledModules: ['progress', 'ai'], apiResponder: opts => { pending = opts; } });
         await flush();
         fixture.store.gb_enable_ai = 'off';
-        pending.onload({ status: 200, responseText: '{"choices":[{"message":{"content":"B"}}]}' });
+        pending.onload({ status: 200, responseText: '{"choices":[{"finish_reason":"stop","message":{"content":"B"}}]}' });
         await flush();
         assert(selectedIds(fixture).length === 0 && !submitted(fixture), 'shared AI preference disabled during a pending answer request blocks later selection and submission');
     }
@@ -1674,6 +1677,303 @@ const selectedIds = ({ window }) => [...window.document.querySelectorAll('i[answ
         const fixture = boot({ autoStart: false, enabledModules: ['progress'], pageGlobals: moduleCourse, sessionRecord });
         await flush();
         assert(fixture.fx.ajaxCalls.length === 0 && fixture.fx.fetchCalls.length === 0 && scopedWrites(fixture).length === 0 && fixture.window.document.getElementById('gxb-status').textContent === '已暂停', `${name} cannot restore execution consent`);
+    }
+
+    console.log('\n── DeepSeek compatibility: defaults and explicit migration ──');
+    {
+        const fixture = quizFixture();
+        await flush();
+        const body = JSON.parse(fixture.fx.deepseekReqs[0].data);
+        assert(body.model === 'deepseek-flash' && body.thinking.type === 'disabled' && body.max_tokens === 128 && body.stream === false,
+            'new installation requests flash with explicit non-thinking mode and a bounded answer budget');
+        assert(submitted(fixture), 'complete stop response selects and submits a valid single answer');
+    }
+    for (const retired of ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp']) {
+        const fixture = quizFixture({ autoStart: false, enabledModules: ['ai'], gmStore: {
+            gb_deepseek_model: retired, gb_deepseek_key: 'sk-preserved-fixture',
+            [scopedKey('gb_auto_step')]: 'completed',
+        } });
+        await flush();
+        assert(fixture.store.gb_deepseek_model === retired && !fixture.window.document.getElementById('gxb-migrate-model').hidden,
+            `${retired}: upgrade offers migration without rewriting the saved choice`);
+        clickControl(fixture, 'gxb-migrate-model');
+        await flush();
+        assert(fixture.store.gb_deepseek_model === 'deepseek-flash' && fixture.store.gb_deepseek_key === 'sk-preserved-fixture'
+            && stateOf(fixture.store) === 'completed' && fixture.store.gb_quiz_confirm === 'off', `${retired}: confirmed migration preserves key, submission preference and course records`);
+        assert(fixture.fx.deepseekReqs.length === 0 && !controlSession(fixture) && !submitted(fixture), `${retired}: migration makes no paid request or course action`);
+        clickControl(fixture, 'gxb-start');
+        await flush();
+        assert(JSON.parse(fixture.fx.deepseekReqs[0].data).model === 'deepseek-flash' && submitted(fixture), `${retired}: a separate explicit Start runs the migrated model`);
+    }
+    {
+        const fixture = quizFixture({ autoStart: false, gmStore: { gb_deepseek_model: 'deepseek-chat' } });
+        fixture.window.confirm = () => false;
+        clickControl(fixture, 'gxb-migrate-model');
+        clickControl(fixture, 'gxb-start');
+        await flush();
+        assert(fixture.store.gb_deepseek_model === 'deepseek-chat' && fixture.fx.deepseekReqs.length === 0
+            && selectedIds(fixture).length === 0 && !submitted(fixture), 'declined migration preserves the old setting and blocks retired-model requests');
+        assert(fixture.fx.alerts.some(message => /模型已退役/.test(message)), 'retired configuration produces an actionable failure');
+    }
+    for (const model of ['deepseek-v4-pro', 'my-custom-model']) {
+        const fixture = quizFixture({ gmStore: { gb_deepseek_model: model } });
+        await flush();
+        assert(fixture.store.gb_deepseek_model === model && JSON.parse(fixture.fx.deepseekReqs[0].data).model === model
+            && fixture.window.document.getElementById('gxb-migrate-model').hidden, `${model}: custom/active choice is kept unchanged and sent as selected`);
+    }
+    {
+        const fixture = quizFixture({ autoStart: false, gmStore: { gb_deepseek_model: 'deepseek-chat' } });
+        fixture.window.confirm = () => { fixture.store.gb_deepseek_model = 'my-custom-model'; return true; };
+        clickControl(fixture, 'gxb-migrate-model');
+        assert(fixture.store.gb_deepseek_model === 'my-custom-model', 'migration cannot overwrite a setting changed in another tab while the prompt was open');
+    }
+    {
+        const fixture = quizFixture({ autoStart: false });
+        fixture.window.prompt = () => 'my-custom-model';
+        fixture.fx.menus.find(menu => /设置 DeepSeek 模型/.test(menu.name)).callback();
+        await flush();
+        assert(fixture.store.gb_deepseek_model === 'my-custom-model' && !controlSession(fixture) && fixture.fx.deepseekReqs.length === 0,
+            'editing model configuration remains paused and never triggers a request');
+        fixture.window.prompt = () => 'deepseek-chat';
+        fixture.fx.menus.find(menu => /设置 DeepSeek 模型/.test(menu.name)).callback();
+        assert(fixture.store.gb_deepseek_model === 'my-custom-model', 'model menu rejects known retired names without replacing the valid setting');
+    }
+
+    console.log('\n── DeepSeek compatibility: completion and error safety ──');
+    const completeResponse = (content = 'A', finish_reason = 'stop', extra = {}) => ({ choices: [{ finish_reason, message: { content, ...extra } }] });
+    const errorCases = [
+        ['truncated plausible answer', 200, completeResponse('A', 'length'), /输出截断/],
+        ['missing finish reason', 200, { choices: [{ message: { content: 'A' } }] }, /生成未完成/],
+        ['null finish reason', 200, completeResponse('A', null), /生成未完成/],
+        ['filtered output', 200, completeResponse('A', 'content_filter'), /生成未完成/],
+        ['aborted generation', 200, completeResponse('A', 'aborted'), /生成未完成/],
+        ['resource exhaustion', 200, completeResponse('A', 'insufficient_system_resource'), /生成未完成/],
+        ['tool call', 200, completeResponse('A', 'tool_calls'), /生成未完成/],
+        ['unexpected tool payload', 200, completeResponse('A', 'stop', { tool_calls: [{}] }), /生成未完成/],
+        ['reasoning without final answer', 200, completeResponse(null, 'stop', { reasoning_content: 'A' }), /空答案/],
+        ['blank final answer', 200, completeResponse('  '), /空答案/],
+        ['malformed content type', 200, completeResponse(['A']), /空答案/],
+        ['missing choice', 200, {}, /响应格式/],
+        ['multiple choices', 200, { choices: [completeResponse().choices[0], completeResponse('B').choices[0]] }, /响应格式/],
+        ['authentication', 401, null, /密钥错误/],
+        ['quota', 402, null, /额度不足/],
+        ['permission', 403, null, /权限不足/],
+        ['model not found', 404, null, /模型不可用/],
+        ['invalid model code', 400, { error: { code: 'model_not_found' } }, /模型不可用/],
+        ['model error message', 400, { error: { message: 'Model Not Exist' } }, /模型不可用/],
+        ['model parameter', 422, { error: { param: 'model' } }, /模型不可用/],
+        ['bad format', 400, null, /请求参数/],
+        ['invalid parameters', 422, null, /请求参数/],
+        ['rate limit', 429, null, /限流/],
+        ['server error', 500, null, /服务异常/],
+        ['overloaded', 503, null, /服务异常/],
+        ['unknown HTTP', 418, null, /API 错误/],
+        ['status zero', 0, completeResponse(), /网络失败/],
+        ['unknown status', undefined, completeResponse(), /网络失败/],
+        ['invalid JSON', 200, '{secret-placeholder', /响应格式/],
+        ['200 API error', 200, { error: { code: 'invalid_api_key', message: 'secret-placeholder' } }, /密钥错误/],
+        ['network failure', 'error', null, /网络失败/],
+        ['timeout', 'timeout', null, /超时/],
+        ['abort callback', 'abort', null, /请求取消/],
+        ['request setup exception', 'throw', null, /网络失败/],
+    ];
+    for (const [name, status, response, expected] of errorCases) {
+        const fixture = quizFixture({
+            questions: [
+                { title: 'First', answerList: [{ answerId: 'a1', text: 'one' }] },
+                { title: 'Second', answerList: [{ answerId: 'b1', text: 'two' }] },
+            ],
+            html: '<i class="gxb-icon-radio" answer_id="a1"></i><i class="gxb-icon-radio" answer_id="b1"></i><button id="quizSubmit">Submit</button>',
+            apiResponder: opts => {
+                if (status === 'error') opts.onerror({ message: 'secret-placeholder' });
+                else if (status === 'timeout') opts.ontimeout({});
+                else if (status === 'abort') opts.onabort({});
+                else if (status === 'throw') throw new Error('secret-placeholder');
+                else opts.onload({ status, responseText: typeof response === 'string' ? response : JSON.stringify(response) });
+            },
+        });
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 1 && !submitted(fixture) && selectedIds(fixture).length === 0
+            && fixture.fx.navigations.length === 0, `${name}: stops further API calls and leaves answers/submission/navigation untouched`);
+        assert(fixture.fx.alerts.some(message => expected.test(message)) && fixture.fx.alerts.every(message => !message.includes('secret-placeholder')),
+            `${name}: visible handling guidance is sanitized`);
+    }
+    {
+        const fixture = quizFixture({ apiResponder: opts => opts.onload({ status: 200, responseText: JSON.stringify(completeResponse('B', 'stop', { reasoning_content: 'A' })) }) });
+        await flush();
+        assert(JSON.stringify(selectedIds(fixture)) === '["a2"]' && submitted(fixture), 'only final content is selected when reasoning disagrees');
+    }
+    {
+        const answerList = Array.from({ length: 26 }, (_, index) => ({ answerId: `option-${index}`, text: `Choice ${index}` }));
+        const fixture = quizFixture({ questions: [{ title: 'All choices', questionType: 'multiple_answers', answerList }],
+            html: '<div>' + answerList.map(answer => `<i class="gxb-icon-checkbox" answer_id="${answer.answerId}"></i>`).join('') + '</div><button id="quizSubmit">Submit</button>',
+            deepseekReply: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        });
+        await flush();
+        assert(selectedIds(fixture).length === 26 && submitted(fixture) && JSON.parse(fixture.fx.deepseekReqs[0].data).max_tokens === 128,
+            'multi-choice response supports all 26 legal options within the non-thinking budget');
+    }
+
+    console.log('\n── DeepSeek compatibility: connection test is explicit and isolated ──');
+    {
+        const fixture = quizFixture({ autoStart: false, enabledModules: null, deepseekReply: 'A' });
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 0, 'connection test never runs on load');
+        clickControl(fixture, 'gxb-test-connection');
+        await flush();
+        const request = JSON.parse(fixture.fx.deepseekReqs[0].data);
+        assert(fixture.fx.confirmationPrompts.some(message => /费用/.test(message)) && fixture.fx.deepseekReqs.length === 1,
+            'accepted cost disclosure permits exactly one test request with modules disabled');
+        assert(!request.messages.some(message => message.content.includes('Fixture question')) && request.messages.some(message => message.content.includes('连接测试')),
+            'connection test sends fixed text rather than live course questions');
+        assert(fixture.fx.alerts.some(message => /连接测试通过/.test(message)) && !controlSession(fixture) && selectedIds(fixture).length === 0
+            && !submitted(fixture) && fixture.fx.navigations.length === 0 && scopedWrites(fixture).length === 0,
+            'successful connection test leaves course state, answers, submission and authorization untouched');
+    }
+    for (const [name, gmStore, decline] of [
+        ['declined charge prompt', {}, true], ['missing key', { gb_deepseek_key: '' }, false], ['retired model', { gb_deepseek_model: 'deepseek-chat' }, false],
+    ]) {
+        const fixture = quizFixture({ autoStart: false, gmStore });
+        if (decline) fixture.window.confirm = () => false;
+        clickControl(fixture, 'gxb-test-connection');
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 0 && !submitted(fixture) && !controlSession(fixture), `${name}: connection test makes no request`);
+    }
+    for (const [name, apiResponder, expected] of [
+        ['rate limited test', opts => opts.onload({ status: 429, responseText: '{}' }), /限流/],
+        ['truncated test', opts => opts.onload({ status: 200, responseText: JSON.stringify(completeResponse('A', 'length')) }), /输出截断/],
+        ['wrong test answer', opts => opts.onload({ status: 200, responseText: JSON.stringify(completeResponse('B')) }), /未按固定测试指令/],
+    ]) {
+        const fixture = quizFixture({ autoStart: false, apiResponder });
+        fixture.fx.menus.find(menu => /测试 DeepSeek 连接/.test(menu.name)).callback();
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 1 && fixture.fx.alerts.some(message => expected.test(message))
+            && !submitted(fixture) && !controlSession(fixture), `${name}: no false success, retry, fallback or course side effect`);
+    }
+    for (const [key, replacement] of [['gb_deepseek_model', 'deepseek-v4-pro'], ['gb_deepseek_key', 'sk-changed-fixture']]) {
+        const fixture = quizFixture({ autoStart: false });
+        fixture.window.confirm = () => { fixture.store[key] = replacement; return true; };
+        clickControl(fixture, 'gxb-test-connection');
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 0 && !controlSession(fixture), `${key}: connection test cannot charge changed configuration after the cost prompt`);
+    }
+    {
+        let pending;
+        const fixture = quizFixture({ autoStart: false, apiResponder: opts => { pending = opts; } });
+        clickControl(fixture, 'gxb-test-connection');
+        await flush();
+        clickControl(fixture, 'gxb-test-connection');
+        clickControl(fixture, 'gxb-start');
+        assert(fixture.fx.deepseekReqs.length === 1 && !controlSession(fixture)
+            && fixture.window.document.getElementById('gxb-status').textContent.includes('正在测试'), 'pending connection test is visible and excludes duplicate tests and course Start');
+        clickControl(fixture, 'gxb-pause');
+        pending.onload({ status: 200, responseText: JSON.stringify(completeResponse()) });
+        await flush();
+        assert(fixture.fx.apiAborts === 1 && !fixture.fx.alerts.some(message => /连接测试通过/.test(message)) && !submitted(fixture)
+            && !fixture.window.document.getElementById('gxb-test-connection').disabled, 'Pause cancels a connection test and ignores its late success');
+    }
+    {
+        let pending;
+        const fixture = quizFixture({ apiResponder: opts => { pending = opts; } });
+        await flush();
+        fixture.window.prompt = () => 'custom-new-model';
+        fixture.fx.menus.find(menu => /设置 DeepSeek 模型/.test(menu.name)).callback();
+        pending.onload({ status: 200, responseText: JSON.stringify(completeResponse()) });
+        await flush();
+        assert(fixture.fx.apiAborts === 1 && selectedIds(fixture).length === 0 && !submitted(fixture)
+            && !controlSession(fixture), 'editing the model cancels a pending quiz and cannot apply an old-model answer');
+    }
+
+    {
+        let oldQuizRequest;
+        const fixture = quizFixture({ apiResponder: (opts, number) => {
+            if (number === 1) oldQuizRequest = opts;
+            else opts.onload({ status: 200, responseText: JSON.stringify(completeResponse()) });
+        } });
+        await flush();
+        clickControl(fixture, 'gxb-test-connection');
+        await flush();
+        oldQuizRequest.onload({ status: 200, responseText: JSON.stringify(completeResponse('B')) });
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 2 && fixture.fx.apiAborts === 1 && !controlSession(fixture)
+            && !submitted(fixture) && selectedIds(fixture).length === 0 && fixture.fx.alerts.some(message => /连接测试通过/.test(message)),
+            'connection test pauses an active quiz, aborts its request and ignores its late answer');
+    }
+
+    console.log('\n── DeepSeek compatibility: shared configuration invalidates active consent ──');
+    for (const [key, replacement] of [['gb_deepseek_model', 'deepseek-v4-pro'], ['gb_deepseek_key', 'sk-changed-fixture']]) {
+        for (const watcher of [false, true]) {
+            let pending;
+            const fixture = quizFixture({ apiResponder: opts => { pending = opts; } });
+            await flush();
+            fixture.store[key] = replacement;
+            if (watcher) fixture.fx.intervals.forEach(callback => callback());
+            pending.onload({ status: 200, responseText: JSON.stringify(completeResponse('A')) });
+            await flush();
+            assert(!submitted(fixture) && selectedIds(fixture).length === 0 && !controlSession(fixture)
+                && fixture.fx.deepseekReqs.length === 1, `${key}, watcher=${watcher}: shared edit blocks late answer, submit and further requests`);
+            if (watcher) assert(fixture.fx.apiAborts === 1, `${key}: configuration watcher aborts the pending request`);
+            fixture.fx.menus.find(menu => /重试当前页面/.test(menu.name)).callback();
+            await flush();
+            const body = JSON.parse(fixture.fx.deepseekReqs[1].data);
+            assert(controlSession(fixture) && (key === 'gb_deepseek_model' ? body.model === replacement
+                : fixture.fx.deepseekReqs[1].headers.Authorization === `Bearer ${replacement}`), `${key}: explicit restart uses the newly reviewed configuration`);
+        }
+        {
+            let pending;
+            const fixture = quizFixture({ autoStart: false, apiResponder: opts => { pending = opts; } });
+            clickControl(fixture, 'gxb-test-connection');
+            await flush();
+            fixture.store[key] = replacement;
+            fixture.fx.intervals.forEach(callback => callback());
+            pending.onload({ status: 200, responseText: JSON.stringify(completeResponse()) });
+            await flush();
+            assert(fixture.fx.apiAborts === 1 && !fixture.fx.alerts.some(message => /连接测试通过/.test(message))
+                && !controlSession(fixture), `${key}: shared edit cancels an in-flight connection test`);
+        }
+        {
+            const fixture = quizFixture({ deepseekReply: 'A', onReady(window) {
+                window.document.getElementById('quizSubmit').addEventListener('click', () => window.GM_setValue(key, replacement));
+            } });
+            await flush();
+            assert(submitted(fixture) && !fixture.window.document.querySelector('.gxb-sure').dataset.autoClicked
+                && !controlSession(fixture), `${key}: edit between submit and confirm blocks confirmation`);
+        }
+    }
+
+    console.log('\n── DeepSeek compatibility: configuration revision survives navigation ──');
+    for (const [menuName, replacement] of [['设置 DeepSeek 模型', 'deepseek-v4-pro'], ['设置 DeepSeek API Key', 'sk-changed-fixture']]) {
+        const first = quizFixture({ autoStart: false, enabledModules: ['ai'], gmStore: { gb_quiz_confirm: 'on' } });
+        clickControl(first, 'gxb-start');
+        await flush();
+        const savedSession = JSON.parse(controlSession(first));
+        const otherTab = quizFixture({ autoStart: false, gmStore: first.store });
+        otherTab.window.prompt = () => replacement;
+        otherTab.fx.menus.find(menu => menu.name.includes(menuName)).callback();
+        // Reload before the first document observes the shared configuration change.
+        const reloaded = quizFixture({ autoStart: false, enabledModules: ['ai'], gmStore: otherTab.store, sessionRecord: savedSession });
+        await flush();
+        assert(reloaded.fx.deepseekReqs.length === 0 && !controlSession(reloaded) && !submitted(reloaded),
+            `${menuName}: reload refuses consent from before a shared configuration edit`);
+        clickControl(reloaded, 'gxb-start');
+        await flush();
+        assert(reloaded.fx.deepseekReqs.length === 1 && controlSession(reloaded), `${menuName}: renewed explicit Start authorizes the new revision`);
+        assert(!controlSession(reloaded).includes('sk-') && !controlSession(reloaded).includes('deepseek-v4-pro'),
+            `${menuName}: persisted consent contains no API key or model value`);
+    }
+    {
+        const fixture = quizFixture({ enabledModules: ['ai'], gmStore: { gb_quiz_confirm: 'on' } });
+        await flush();
+        const reloaded = quizFixture({ autoStart: false, enabledModules: ['ai'], gmStore: fixture.store,
+            sessionRecord: JSON.parse(controlSession(fixture)),
+        });
+        await flush();
+        assert(reloaded.fx.deepseekReqs.length === 1 && controlSession(reloaded), 'unchanged configuration preserves same-tab consent across reload');
+    }
+    {
+        const fixture = quizFixture({ autoStart: false, sessionRecord: { host: 'fixture.class.gaoxiaobang.com', course: '10001', user: null, modules: ['ai'], apiRevision: undefined } });
+        await flush();
+        assert(fixture.fx.deepseekReqs.length === 0 && !controlSession(fixture), 'legacy session without a config revision starts paused after upgrade');
     }
 
     console.log(`\n═══ Results: ${pass} passed, ${fail} failed ═══`);
